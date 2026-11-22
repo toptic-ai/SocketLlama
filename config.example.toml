@@ -1,0 +1,80 @@
+# socketllama configuration. Copy to config.toml (which is git-ignored) and adjust.
+
+[gateway]
+# Shown on your machine's page in toptic.ai (My Machines -> your machine), which also offers
+# this whole [gateway] block ready to copy.
+url = "wss://toptic.example/ws/socketllama/"
+instance = "yourname-home-gpu"
+# The connection token (machine's page -> Create connection token; an API token with exactly
+# the scope "socketllama:connect") and the machine's signing secret.
+# Prefer environment variables over writing secrets into this file. If you do write them here
+# (token = "...", signing_secret = "..."), the client only starts once the file is chmod 600.
+token_env = "SOCKETLLAMA_TOKEN"
+signing_secret_env = "SOCKETLLAMA_SIGNING_SECRET"
+# allow_insecure = true        # permits ws:// - only for a toptic.ai dev server on localhost
+
+[client]
+# All optional; these are the defaults.
+ping_interval = 30             # seconds between keep-alive pings
+pong_timeout = 20              # seconds to wait for the pong before reconnecting
+reconnect_min = 1              # first reconnect delay, doubled after every failure ...
+reconnect_max = 60             # ... up to this many seconds
+max_concurrent_requests = 4    # requests relayed at the same time
+
+# The backends below are the complete allow-list: the gateway can only name one of them,
+# it can never make the client call another host. base_url is the OpenAI-compatible API
+# root, i.e. the URL that serves /chat/completions.
+
+[[backends]]
+name = "ollama"
+kind = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+# Required: the models to share. models = [] shares every chat model the backend offers,
+# including any you pull later (the client warns about that at start).
+models = ["llama3.1:8b", "qwen3:14b"]
+# Context window toptic.ai plans prompts for. Without it the client reports what Ollama uses for
+# API requests: the loaded model's window, else the Modelfile's num_ctx, else Ollama's default
+# 4096 (OLLAMA_CONTEXT_LENGTH on the server is only visible once the model is loaded). Set it to
+# your OLLAMA_CONTEXT_LENGTH if you raised that. Never more than the model supports.
+# context_length = 16384
+# Seconds the client waits for the backend, for an answer to begin and for each further part of
+# it. 600 without this line. For an Ollama model that has to be loaded first the client waits
+# longer if toptic.ai does and says so (version 0.20 and newer). See "Slow model loads" in
+# README.md.
+# read_timeout = 600
+# How long Ollama keeps a model in memory after a request that came through toptic.ai: a time
+# ("30m", "2h", "1h30m"), a number of seconds, or -1 for as long as Ollama runs. Without this
+# line the client says nothing and Ollama decides (5 minutes, or its OLLAMA_KEEP_ALIVE). A model
+# in memory occupies RAM/VRAM for that time. Only for kind = "ollama"; see README.md.
+# keep_loaded = "30m"
+# Load the models listed above into memory when the client starts, so the first prompt does not
+# wait for it. Needs the models listed: refused together with models = [].
+# load_at_start = true
+# What a model costs the people you share it with, in USD per 1M tokens of the prompt (input)
+# and of the answer (output). It counts against the quotas you give them; toptic.ai bills
+# nobody. Without a line a model costs what its backend reports (nothing, for Ollama). A price
+# set on the machine's page in toptic.ai is written into this table by the running client, so
+# the file shows the price in force; a line changed here counts once the client is restarted.
+# The table comes last in its backend; the names must be among its models. See README.md.
+# [backends.prices_per_1m_tokens]
+# "llama3.1:8b" = { input = 0.80, output = 2.00 }
+# What a model is good for, shown with it in toptic.ai: one line of at most 500 characters. It
+# is kept up to date like the prices: a description set on the machine's page is written into
+# this table by the running client, and a line changed here counts once the client is
+# restarted. This table also comes last, before or after the prices. See README.md.
+# [backends.descriptions]
+# "llama3.1:8b" = "Quick answers to short questions, in English and German"
+
+[[backends]]
+name = "litellm"
+kind = "litellm"                # LiteLLM proxy, local or remote: limits and prices are read from /model/info
+base_url = "http://127.0.0.1:4000/v1"
+api_key_env = "LITELLM_API_KEY"  # a LiteLLM virtual key; it never leaves this machine
+models = ["gpt-4o-mini"]         # model names as the proxy lists them
+
+# Any other OpenAI-compatible server (vLLM, llama.cpp server, LM Studio, ...):
+# [[backends]]
+# name = "vllm"
+# kind = "openai"
+# base_url = "http://192.168.1.20:8000/v1"
+# models = ["Qwen/Qwen3-14B"]

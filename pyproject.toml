@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "socketllama"
+version = "0.1.0"
+description = "Connect your local Ollama or OpenAI-compatible models to toptic.ai through an outbound WebSocket. Use and share your local models"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=13",
+]
+
+[project.urls]
+Repository = "https://github.com/toptic-ai/SocketLlama"
+Changelog = "https://github.com/toptic-ai/SocketLlama/blob/main/CHANGELOG.md"
+Issues = "https://github.com/toptic-ai/SocketLlama/issues"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+socketllama = "socketllama.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

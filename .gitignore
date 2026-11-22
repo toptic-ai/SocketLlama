@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+# real configuration holds a token and a signing secret; so do the backup setup keeps of a replaced
+# one and the file setup writes before it gets its name (left behind only if the computer stops then)
+config.toml
+config.toml.backup-*
+.config.toml.*.tmp
