@@ -153,7 +153,8 @@ class FakeBackend:
 
     def __init__(self, model_info_status=HTTP_OK, extra_model_info_entries=(), loaded_context_length=None,
                  modelfile_num_ctx=None, process_list_status=HTTP_OK, loaded_name=MODEL, more_models=(),
-                 models_that_do_not_fit=(), loads_on_chat=False, usage=None, chat_failure=None):
+                 models_that_do_not_fit=(), loads_on_chat=False, usage=None, chat_failure=None,
+                 architecture_context_length=CONTEXT_LENGTH, show_status=HTTP_OK, in_memory_context_length=None):
         self.requests = []
         # (status, body, content type) every chat completion is answered with instead of an answer, the body
         # as the bytes to send, or as a list of the parts to send it in; None: it is answered
@@ -193,6 +194,12 @@ class FakeBackend:
         self.loaded_context_length = loaded_context_length
         self.modelfile_num_ctx = modelfile_num_ctx
         self.process_list_status = process_list_status
+        # Ollama: the longest context window MODEL's architecture supports (/api/show model_info)
+        self.architecture_context_length = architecture_context_length
+        # Ollama: the status of /api/show (another one: no details of any model)
+        self.show_status = show_status
+        # Ollama: the context window /api/ps lists for the models of ``in_memory`` (None: none, as older versions)
+        self.in_memory_context_length = in_memory_context_length
         # appended to LiteLLM's /model/info answer, e.g. malformed entries
         self.extra_model_info_entries = list(extra_model_info_entries)
         # set by tests that need the stream to stall after its first event
@@ -256,6 +263,9 @@ class FakeBackend:
             await self.hold_generate.wait()
             await self._load(writer, payload)
         elif (method, path) == ('POST', '/api/show'):
+            if self.show_status != HTTP_OK:
+                await self._json(writer, {'error': 'not found'}, status=self.show_status)
+                return
             is_chat = payload['model'] != EMBEDDING_MODEL
             parameters = 'stop                           "<|eot_id|>"'
             if self.modelfile_num_ctx is not None:
@@ -263,7 +273,8 @@ class FakeBackend:
             await self._json(writer, {
                 'capabilities': ['completion', 'tools'] if is_chat else ['embedding'],
                 'parameters': parameters,
-                'model_info': {'general.architecture': 'llama', 'llama.context_length': CONTEXT_LENGTH}})
+                'model_info': {'general.architecture': 'llama',
+                               'llama.context_length': self.architecture_context_length}})
         elif (method, path) == ('GET', '/api/ps'):
             await self.hold_process_list.wait()
             if self.process_list_status != HTTP_OK:
@@ -271,7 +282,8 @@ class FakeBackend:
                 return
             loaded = [] if self.loaded_context_length is None else [
                 {'name': self.loaded_name, 'model': self.loaded_name, 'context_length': self.loaded_context_length}]
-            loaded += [{'name': name, 'model': name} for name in self.in_memory]
+            window = {} if self.in_memory_context_length is None else {'context_length': self.in_memory_context_length}
+            loaded += [{'name': name, 'model': name, **window} for name in self.in_memory]
             await self._json(writer, {'models': loaded})
         elif (method, path) == ('GET', '/v1/model/info'):
             if self.model_info_status != HTTP_OK:

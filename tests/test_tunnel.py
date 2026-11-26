@@ -14,6 +14,7 @@ from socketllama.client import (
     MODELS_REPORT_RESEND_SECONDS, REPLACED_RETRY_SECONDS, STABLE_CONNECTION_SECONDS, WIRE_LOGGER_NAME,
     FatalGatewayError, GatewayConnectionLost, TunnelClient,
 )
+from socketllama.config import KIND_LITELLM, KIND_OPENAI
 from socketllama.relay import Relay
 
 from .conftest import (
@@ -30,6 +31,8 @@ QUIET_SECONDS = 0.2
 RUNTIME_CONTEXT_LENGTH = 16384
 MODELFILE_NUM_CTX = 8192
 CONFIGURED_CONTEXT_LENGTH = 32768
+# An architecture that supports less than Ollama's default window (llava:13b supports exactly the default)
+SMALL_ARCHITECTURE_CONTEXT_LENGTH = DEFAULT_OLLAMA_CONTEXT_LENGTH // 2
 REFUSED_BURST = 8
 SMALL_FRAME_LIMIT_BYTES = 4096
 # enough leading characters of a base64 body to recognise it in a log line
@@ -92,35 +95,74 @@ async def test_refuses_a_gateway_that_sends_no_nonce(backend):
 
 async def test_reports_ollama_chat_models_with_a_conservative_context_length(gateway, running_client):
     report = await gateway.next_frame(protocol.FRAME_MODELS)
-    # not loaded, no num_ctx: Ollama serves the default window, not the architecture's maximum
+    # not loaded, no num_ctx: Ollama serves the default window, not the architecture's maximum, and says
+    # that it is the default
     assert report['backends'] == [{'name': 'ollama', 'kind': 'ollama', 'models': [
-        {'name': MODEL, 'context_length': DEFAULT_OLLAMA_CONTEXT_LENGTH, 'supports_reasoning': False}]}]
+        {'name': MODEL, 'context_length': DEFAULT_OLLAMA_CONTEXT_LENGTH,
+         protocol.CONTEXT_LENGTH_SOURCE_FIELD: protocol.CONTEXT_LENGTH_SOURCE_DEFAULT, 'supports_reasoning': False}]}]
 
 
-async def _reported_context_length(gateway, backend_options=None, **fake_options) -> int:
+async def _reported_ollama_model(gateway, backend_options=None, **fake_options) -> dict:
     async with FakeBackend(**fake_options) as backend:
         client = TunnelClient(make_config(gateway.url, [ollama_backend(backend, **(backend_options or {}))]))
         task = await start(client)
         report = await gateway.next_frame(protocol.FRAME_MODELS)
         await finish(client, task)
-    return report['backends'][0]['models'][0]['context_length']
+    return report['backends'][0]['models'][0]
 
 
-@pytest.mark.parametrize('fake_options, backend_options, expected', [
+@pytest.mark.parametrize('fake_options, backend_options, expected, source', [
     # the window of the loaded model is what requests get
     ({'loaded_context_length': RUNTIME_CONTEXT_LENGTH, 'modelfile_num_ctx': MODELFILE_NUM_CTX}, None,
-     RUNTIME_CONTEXT_LENGTH),
-    ({'modelfile_num_ctx': MODELFILE_NUM_CTX}, None, MODELFILE_NUM_CTX),
-    ({'process_list_status': HTTP_NOT_FOUND}, None, DEFAULT_OLLAMA_CONTEXT_LENGTH),
+     RUNTIME_CONTEXT_LENGTH, protocol.CONTEXT_LENGTH_SOURCE_LOADED),
+    ({'modelfile_num_ctx': MODELFILE_NUM_CTX}, None, MODELFILE_NUM_CTX, protocol.CONTEXT_LENGTH_SOURCE_MODELFILE),
+    # nothing names a window: Ollama's default
+    ({'process_list_status': HTTP_NOT_FOUND}, None, DEFAULT_OLLAMA_CONTEXT_LENGTH,
+     protocol.CONTEXT_LENGTH_SOURCE_DEFAULT),
     # the configuration wins over everything Ollama says ...
     ({'loaded_context_length': RUNTIME_CONTEXT_LENGTH}, {'context_length': CONFIGURED_CONTEXT_LENGTH},
-     CONFIGURED_CONTEXT_LENGTH),
-    # ... but never exceeds what the model architecture supports
-    ({}, {'context_length': CONTEXT_LENGTH * 2}, CONTEXT_LENGTH),
-    ({'loaded_context_length': CONTEXT_LENGTH * 2}, None, CONTEXT_LENGTH),
+     CONFIGURED_CONTEXT_LENGTH, protocol.CONTEXT_LENGTH_SOURCE_CONFIGURED),
+    # ... but never exceeds what the model architecture supports; the source stays the one that named it
+    ({}, {'context_length': CONTEXT_LENGTH * 2}, CONTEXT_LENGTH, protocol.CONTEXT_LENGTH_SOURCE_CONFIGURED),
+    ({'loaded_context_length': CONTEXT_LENGTH * 2}, None, CONTEXT_LENGTH, protocol.CONTEXT_LENGTH_SOURCE_LOADED),
+    ({'architecture_context_length': SMALL_ARCHITECTURE_CONTEXT_LENGTH}, None, SMALL_ARCHITECTURE_CONTEXT_LENGTH,
+     protocol.CONTEXT_LENGTH_SOURCE_DEFAULT),
+    # a window the model really has, the same as the default, is told apart from the default
+    ({'architecture_context_length': DEFAULT_OLLAMA_CONTEXT_LENGTH,
+      'loaded_context_length': DEFAULT_OLLAMA_CONTEXT_LENGTH}, None, DEFAULT_OLLAMA_CONTEXT_LENGTH,
+     protocol.CONTEXT_LENGTH_SOURCE_LOADED),
 ])
-async def test_ollama_context_length_sources(gateway, fake_options, backend_options, expected):
-    assert await _reported_context_length(gateway, backend_options, **fake_options) == expected
+async def test_ollama_context_length_sources(gateway, fake_options, backend_options, expected, source):
+    model = await _reported_ollama_model(gateway, backend_options, **fake_options)
+    assert model['context_length'] == expected
+    assert model[protocol.CONTEXT_LENGTH_SOURCE_FIELD] == source
+
+
+@pytest.mark.parametrize('fake_options, backend_options, expected, source', [
+    ({}, None, DEFAULT_OLLAMA_CONTEXT_LENGTH, protocol.CONTEXT_LENGTH_SOURCE_DEFAULT),
+    # what is known without the details still counts
+    ({'loaded_context_length': RUNTIME_CONTEXT_LENGTH}, None, RUNTIME_CONTEXT_LENGTH,
+     protocol.CONTEXT_LENGTH_SOURCE_LOADED),
+    ({}, {'context_length': CONFIGURED_CONTEXT_LENGTH}, CONFIGURED_CONTEXT_LENGTH,
+     protocol.CONTEXT_LENGTH_SOURCE_CONFIGURED),
+])
+async def test_a_model_without_details_is_reported_with_the_window_known_without_them(
+        gateway, fake_options, backend_options, expected, source):
+    model = await _reported_ollama_model(gateway, backend_options, show_status=HTTP_NOT_FOUND, **fake_options)
+    # whether it reasons is unknown: left out, not claimed either way
+    assert model == {'name': MODEL, 'context_length': expected, protocol.CONTEXT_LENGTH_SOURCE_FIELD: source}
+
+
+@pytest.mark.parametrize('kind', [KIND_LITELLM, KIND_OPENAI])
+@pytest.mark.parametrize('backend_options', [{}, {'context_length': CONFIGURED_CONTEXT_LENGTH}])
+async def test_other_backends_send_no_context_length_source(gateway, backend, kind, backend_options):
+    client = TunnelClient(make_config(gateway.url, [litellm_backend(backend, kind=kind, **backend_options)]))
+    task = await start(client)
+    report = await gateway.next_frame(protocol.FRAME_MODELS)
+    await finish(client, task)
+    models = report['backends'][0]['models']
+    assert models
+    assert all(protocol.CONTEXT_LENGTH_SOURCE_FIELD not in model for model in models)
 
 
 async def test_reports_litellm_models_with_limits_and_prices(gateway, backend):

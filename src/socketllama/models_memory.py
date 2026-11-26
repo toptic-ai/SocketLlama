@@ -13,6 +13,18 @@ relayed answer of an Ollama backend ended (its model is in memory now) and once 
 is over. At most one frame goes out in MODELS_MEMORY_MIN_INTERVAL_SECONDS; what changes before
 that has passed is sent once it has, as one frame with the latest state.
 
+Each check also compares the window /api/ps lists for a model in memory with the one the last
+models report (as sent) carried for it as loaded (protocol.CONTEXT_LENGTH_SOURCE_LOADED; none
+for another source): when they differ, the client is asked for a fresh models report. That is a
+model that came into memory, and one Ollama loaded again with another window (another program
+loaded it with its own num_ctx before). Ollama tells the window a model got only while it is
+loaded, and the gateway keeps the last one reported as loaded while the model is out of memory.
+The client sends the report as soon as the gateway takes one again. Not for a model that left
+memory (the gateway keeps its window), one /api/ps lists without a window, one the report did not
+carry, nor for a backend with a configured context_length (its window does not come from
+Ollama). A window is asked for once until a report carries it, so one the report cannot carry as
+it is (capped at the architecture's maximum) does not ask again at every check.
+
 Nothing here is part of relaying: what goes wrong is logged, and requests are relayed on.
 """
 import asyncio
@@ -23,7 +35,7 @@ from collections.abc import Awaitable, Callable, Mapping
 import httpx
 
 from . import events, protocol
-from .backends import ollama_loaded_models, ollama_model_reference
+from .backends import loaded_context_length, ollama_loaded_models, ollama_model_reference
 from .config import KIND_OLLAMA, Backend
 
 logger = logging.getLogger('socketllama')
@@ -52,17 +64,26 @@ class ModelsMemoryReport:
     (``clock``), on an earlier connection; read it back from the attribute when this one is over.
     ``shown``: the snapshot the owner was last shown (see events), on an earlier connection, read back
     the same way; a snapshot is shown when it is not that one, so a reconnect shows nothing again.
+    ``report_outdated``: called, returning at once, when Ollama lists a window for a model in memory
+    that the last models report did not carry for it (see the module docstring).
     """
 
     def __init__(self, backends: Mapping[str, Backend], http: httpx.AsyncClient,
                  send: Callable[[dict], Awaitable[None]], clock: Callable[[], float] = time.monotonic,
-                 sent_at: float | None = None, shown: list[BackendMemory] | None = None) -> None:
+                 sent_at: float | None = None, shown: list[BackendMemory] | None = None,
+                 report_outdated: Callable[[], None] | None = None) -> None:
         self._backends = backends
         self._http = http
         self._send = send
         self._clock = clock
         self.sent_at = sent_at
         self.shown = shown
+        self._report_outdated = report_outdated
+        # Of each Ollama backend the last models report checked, of each of its models: the window that report
+        # carried for it as loaded; None: another source, or none
+        self._reported_windows: dict[str, dict[str, int | None]] = {}
+        # (backend, model): the window from /api/ps a fresh report was last asked for, on this connection
+        self._asked_for: dict[tuple[str, str], int] = {}
         # Of each Ollama backend the last models report checked, the names of its models; None until a report is out
         self._reported: dict[str, list[str]] | None = None
         # What the gateway was last sent on this connection; None: nothing it is known to hold
@@ -74,9 +95,18 @@ class ModelsMemoryReport:
     def models_reported(self, report: list) -> None:
         """The gateway was sent, or already holds, this models report (as sent): names are taken
         from it, and what is in memory is checked."""
-        self._reported = {
-            entry['name']: [model['name'] for model in entry['models']] for entry in report
-            if entry['kind'] == KIND_OLLAMA and entry.get(protocol.BACKEND_CHECKED_FIELD) is not False}
+        checked = [entry for entry in report
+                   if entry['kind'] == KIND_OLLAMA and entry.get(protocol.BACKEND_CHECKED_FIELD) is not False]
+        self._reported = {entry['name']: [model['name'] for model in entry['models']] for entry in checked}
+        self._reported_windows = {
+            entry['name']: {model['name']: model.get('context_length')
+                            if model.get(protocol.CONTEXT_LENGTH_SOURCE_FIELD) == protocol.CONTEXT_LENGTH_SOURCE_LOADED
+                            else None for model in entry['models']}
+            for entry in checked}
+        # A window the report carries is no longer one asked for: if the model comes into memory again later, the
+        # report it is out of memory in carries another source, and the window is asked for again
+        self._asked_for = {(backend, model): window for (backend, model), window in self._asked_for.items()
+                           if self._reported_windows.get(backend, {}).get(model) != window}
         self.check()
 
     def check(self) -> None:
@@ -129,6 +159,7 @@ class ModelsMemoryReport:
         if self._reported is None:
             return None
         snapshot: list[BackendMemory] = []
+        outdated = False
         for name, models in self._reported.items():
             loaded = await ollama_loaded_models(self._backends[name], self._http)
             if loaded is None:
@@ -141,6 +172,24 @@ class ModelsMemoryReport:
             if name in self._failing:
                 self._failing.discard(name)
                 logger.info('Backend %s: toptic.ai is told which of its models are in memory again', name)
+            # every backend is compared, so that each window seen is noted as asked for
+            outdated = self._window_changed(name, loaded) or outdated
             snapshot.append({'backend': name, 'models': [model for model in models
                                                          if ollama_model_reference(model) in loaded]})
+        if outdated and self._report_outdated is not None:
+            self._report_outdated()
         return snapshot
+
+    def _window_changed(self, backend_name: str, loaded: Mapping[str, dict]) -> bool:
+        """Whether /api/ps (``loaded``) lists a window for a model of the backend that the last models report did
+        not carry for it as loaded, one not asked for on this connection yet (see the module docstring)."""
+        if self._backends[backend_name].context_length:
+            return False
+        changed = False
+        for model, reported in self._reported_windows.get(backend_name, {}).items():
+            window = loaded_context_length(loaded.get(ollama_model_reference(model)))
+            if window is None or window == reported or self._asked_for.get((backend_name, model)) == window:
+                continue
+            self._asked_for[(backend_name, model)] = window
+            changed = True
+        return changed

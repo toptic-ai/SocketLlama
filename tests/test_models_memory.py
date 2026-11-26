@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 
 from socketllama import backends as backends_module
+from socketllama import client as client_module
 from socketllama import models_memory, protocol
 from socketllama.client import TunnelClient
 
@@ -32,9 +33,22 @@ SHORT_MIN_INTERVAL_SECONDS = 0.1
 COALESCING_MIN_INTERVAL_SECONDS = 1.5
 # Polls watched for a frame that should not come
 POLLS_WATCHED = 5
+# A report that holds one model of a backend: the others are trimmed from it
+ONE_MODEL_PER_BACKEND = 1
 # A backend's discovery that gives up at once, so it is reported as not checked
 FAST_DISCOVERY_TIMEOUT_SECONDS = 0.1
 MEMORY_TASK = 'ModelsMemoryReport.run'
+# The window Ollama gave a model it loaded (/api/ps), one another program loaded it with (its own num_ctx),
+# and one configured for the backend
+RUNTIME_CONTEXT_LENGTH = 16384
+OTHER_PROGRAM_CONTEXT_LENGTH = 65536
+CONFIGURED_CONTEXT_LENGTH = 32768
+# Shortened least time between two models reports, and a longer one to measure the spacing by
+SHORT_RESEND_SECONDS = 0.2
+SPACED_RESEND_SECONDS = 1.0
+# Watching this many of the (shortened) least times between reports for one that should not come
+REPORT_INTERVALS_WATCHED = 2
+MODELS_ACK = {'type': protocol.FRAME_MODELS_ACK}
 
 
 def memory_frames(gateway: FakeGateway) -> list:
@@ -92,6 +106,33 @@ def memory_sent_at(monkeypatch) -> list[float]:
 
     async def recording_send(socket, frame: dict) -> None:
         if frame['type'] == protocol.FRAME_MODELS_MEMORY:
+            sent_at.append(time.monotonic())
+        await send(socket, frame)
+    monkeypatch.setattr(TunnelClient, '_send', staticmethod(recording_send))
+    return sent_at
+
+
+def models_reports(gateway: FakeGateway) -> list:
+    return [frame for frame in gateway.drain_frames() if frame['type'] == protocol.FRAME_MODELS]
+
+
+def reported_model(report: dict, name: str) -> dict:
+    return next(model for model in report['backends'][0]['models'] if model['name'] == name)
+
+
+@pytest.fixture
+def short_resend(monkeypatch):
+    monkeypatch.setattr(client_module, 'MODELS_REPORT_RESEND_SECONDS', SHORT_RESEND_SECONDS)
+
+
+@pytest.fixture
+def report_sent_at(monkeypatch) -> list[float]:
+    """When the client handed each models report to its socket, on the clock it spaces them with."""
+    sent_at: list[float] = []
+    send = TunnelClient._send
+
+    async def recording_send(socket, frame: dict) -> None:
+        if frame['type'] == protocol.FRAME_MODELS:
             sent_at.append(time.monotonic())
         await send(socket, frame)
     monkeypatch.setattr(TunnelClient, '_send', staticmethod(recording_send))
@@ -217,6 +258,129 @@ async def test_the_least_interval_spans_a_reconnect(memory_gateway, monkeypatch,
             await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY)
     first, second = memory_sent_at
     assert second - first >= COALESCING_MIN_INTERVAL_SECONDS
+
+
+# ----- a fresh models report when a model comes into memory -----
+
+async def test_a_model_that_comes_into_memory_gets_a_fresh_report_with_its_loaded_window(memory_gateway,
+                                                                                         short_interval, short_resend):
+    """Right after the answer that loaded it, not at the next refresh: the window Ollama gave it is known now."""
+    async with FakeBackend(loads_on_chat=True, in_memory_context_length=RUNTIME_CONTEXT_LENGTH) as backend:
+        async with Running(memory_gateway, ollama_backend(backend)):
+            first = await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY)
+            await memory_gateway.send_request('req-1', CHAT)
+            await memory_gateway.collect_response('req-1')
+            fresh = await memory_gateway.next_frame(protocol.FRAME_MODELS)  # well before MODEL_REFRESH_INTERVAL_SECONDS
+    assert reported_model(first, MODEL)[protocol.CONTEXT_LENGTH_SOURCE_FIELD] == protocol.CONTEXT_LENGTH_SOURCE_DEFAULT
+    assert reported_model(fresh, MODEL)['context_length'] == RUNTIME_CONTEXT_LENGTH
+    assert reported_model(fresh, MODEL)[protocol.CONTEXT_LENGTH_SOURCE_FIELD] == protocol.CONTEXT_LENGTH_SOURCE_LOADED
+
+
+async def _watch_for_reports(gateway: FakeGateway, backend: FakeBackend) -> list:
+    """The models reports that come while the client checks its memory a few times and the least time between
+    reports passes a few times."""
+    reads = process_list_reads(backend)
+    await wait_until(lambda: process_list_reads(backend) >= reads + POLLS_WATCHED)
+    await asyncio.sleep(SHORT_RESEND_SECONDS * REPORT_INTERVALS_WATCHED)
+    return models_reports(gateway)
+
+
+async def test_no_fresh_report_while_nothing_comes_into_memory(memory_gateway, fast_poll, short_interval,
+                                                               short_resend):
+    """Neither while the state is unchanged nor when a model leaves memory: the report knows its window still."""
+    async with FakeBackend(in_memory_context_length=RUNTIME_CONTEXT_LENGTH) as backend:
+        backend.in_memory[MODEL] = None
+        async with Running(memory_gateway, ollama_backend(backend)):
+            await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            assert (await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY))['backends'][0]['models'] == [MODEL]
+            assert await _watch_for_reports(memory_gateway, backend) == []
+            del backend.in_memory[MODEL]
+            assert (await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY))['backends'][0]['models'] == []
+            assert await _watch_for_reports(memory_gateway, backend) == []
+
+
+async def test_a_model_loaded_again_with_another_window_gets_a_fresh_report(memory_gateway, fast_poll,
+                                                                            short_interval, short_resend):
+    """In memory before and after: another program had loaded it with its own num_ctx, then Ollama loaded it
+    again with the server's window for a request through toptic.ai. Kept, the window of the other program
+    would outlast every later report of the model out of memory."""
+    async with FakeBackend(in_memory_context_length=OTHER_PROGRAM_CONTEXT_LENGTH) as backend:
+        backend.in_memory[MODEL] = None
+        async with Running(memory_gateway, ollama_backend(backend)):
+            first = await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY)
+            backend.in_memory_context_length = RUNTIME_CONTEXT_LENGTH
+            fresh = await memory_gateway.next_frame(protocol.FRAME_MODELS)  # well before MODEL_REFRESH_INTERVAL_SECONDS
+    assert reported_model(first, MODEL)['context_length'] == OTHER_PROGRAM_CONTEXT_LENGTH
+    assert reported_model(fresh, MODEL)['context_length'] == RUNTIME_CONTEXT_LENGTH
+    assert reported_model(fresh, MODEL)[protocol.CONTEXT_LENGTH_SOURCE_FIELD] == protocol.CONTEXT_LENGTH_SOURCE_LOADED
+
+
+async def test_a_window_the_report_carries_capped_asks_for_one_fresh_report_only(memory_gateway, fast_poll,
+                                                                                short_interval, short_resend):
+    """/api/ps lists more than the architecture supports: the report carries the maximum, which differs from it
+    at every check."""
+    async with FakeBackend(in_memory_context_length=CONTEXT_LENGTH * 2) as backend:
+        backend.in_memory[MODEL] = None
+        async with Running(memory_gateway, ollama_backend(backend)):
+            first = await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            assert await _watch_for_reports(memory_gateway, backend) == []
+    assert reported_model(first, MODEL)['context_length'] == CONTEXT_LENGTH
+
+
+async def test_no_fresh_report_for_a_model_the_report_left_out(memory_gateway, monkeypatch, fast_poll,
+                                                               short_interval, short_resend):
+    """Compared with the report as sent: a model trimmed from it has no window there to differ from."""
+    monkeypatch.setattr(protocol, 'MAX_MODELS_PER_BACKEND', ONE_MODEL_PER_BACKEND)
+    async with FakeBackend(more_models=[SECOND_MODEL], in_memory_context_length=RUNTIME_CONTEXT_LENGTH) as backend:
+        async with Running(memory_gateway, ollama_backend(backend)):
+            first = await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY)
+            backend.in_memory[SECOND_MODEL] = None
+            assert await _watch_for_reports(memory_gateway, backend) == []
+    assert [model['name'] for model in first['backends'][0]['models']] == [MODEL]
+
+
+async def test_no_fresh_report_for_a_backend_with_a_configured_window(memory_gateway, fast_poll, short_interval,
+                                                                      short_resend):
+    """Its report says the configured window whatever Ollama holds."""
+    async with FakeBackend(in_memory_context_length=RUNTIME_CONTEXT_LENGTH) as backend:
+        async with Running(memory_gateway, ollama_backend(backend, context_length=CONFIGURED_CONTEXT_LENGTH)):
+            await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY)
+            backend.in_memory[MODEL] = None
+            assert (await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY))['backends'][0]['models'] == [MODEL]
+            assert await _watch_for_reports(memory_gateway, backend) == []
+
+
+async def test_a_fresh_report_keeps_the_least_time_between_reports(memory_gateway, monkeypatch, fast_poll,
+                                                                   short_interval, report_sent_at):
+    """The gateway stores at most one report in MODELS_REPORT_RESEND_SECONDS: one sent sooner would be ignored."""
+    monkeypatch.setattr(client_module, 'MODELS_REPORT_RESEND_SECONDS', SPACED_RESEND_SECONDS)
+    async with FakeBackend(more_models=[SECOND_MODEL], in_memory_context_length=RUNTIME_CONTEXT_LENGTH) as backend:
+        async with Running(memory_gateway, ollama_backend(backend)):
+            await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            await memory_gateway.next_frame(protocol.FRAME_MODELS_MEMORY)
+            backend.in_memory[MODEL] = None  # at once after the report
+            await memory_gateway.next_frame(protocol.FRAME_MODELS)
+            await memory_gateway.send(MODELS_ACK)
+            backend.in_memory[SECOND_MODEL] = None  # at once after the fresh one
+            fresh = await memory_gateway.next_frame(protocol.FRAME_MODELS)
+    assert reported_model(fresh, SECOND_MODEL)[protocol.CONTEXT_LENGTH_SOURCE_FIELD] == \
+        protocol.CONTEXT_LENGTH_SOURCE_LOADED
+    first, second, third = report_sent_at
+    assert second - first >= SPACED_RESEND_SECONDS
+    assert third - second >= SPACED_RESEND_SECONDS
 
 
 # ----- what is in it -----

@@ -303,6 +303,22 @@ If you raised `OLLAMA_CONTEXT_LENGTH`, set `context_length` to the same value; i
 at what the model supports. toptic.ai plans prompts within this window, so overstating it makes
 Ollama silently cut long conversations from the front.
 
+Each such window is reported with where it comes from (`context_length_source`): `configured`
+(the backend's `context_length`), `loaded` (the model in memory), `modelfile` (its `num_ctx`) or
+`default` (none of these: Ollama's default, capped like the others where the model supports less;
+also when Ollama gives no details of the model). Ollama's API does not tell the server's
+`OLLAMA_CONTEXT_LENGTH`, so a `default` window may be smaller than the one requests get. That is
+why toptic.ai, while a model is out of memory and reported with `default`, keeps the window it
+last saw for it as `loaded`; a `configured`, `modelfile` or `loaded` window replaces it. When a
+model comes into memory, or Ollama loads it again with another window, the client sends a fresh
+report soon, within toptic.ai's limit of one a minute (with a toptic.ai that is told what is in
+memory, see [Which models are in memory](#which-models-are-in-memory)).
+
+So after you lower `OLLAMA_CONTEXT_LENGTH`, or create a model again with a smaller `num_ctx`,
+toptic.ai keeps planning with the window it last saw loaded until the model has been loaded again,
+usually about a minute after the next request. Setting `context_length` for the backend pins the
+window instead.
+
 </details>
 
 ## Models in memory (Ollama)
@@ -487,6 +503,12 @@ reconnect. After that only when something changed. The client looks every minute
 answer through toptic.ai ended, and once `load_at_start` is over. It sends at most one such
 message every 5 seconds: changes that come quicker are sent together, as one message with the
 latest state.
+
+**And a fresh models report.** When one of these checks finds a model in memory with another
+window than the last models report carried for it as loaded, on a backend without
+`context_length`, the client also sends a fresh models report, with the window Ollama gave the
+model, as soon as toptic.ai takes one again (at most one a minute). That is a model that came into
+memory, or one Ollama loaded again with another window. A model that leaves memory does not.
 
 </details>
 
@@ -795,8 +817,9 @@ on both sides together.
   `models.descriptions` (the same for descriptions, in the same reports and frames). Each works
   only when both announced it.
 - **Without a capability**, since a peer from before it just ignores it: `auth_ok` may say how
-  long the gateway waits for a model to load (`model_loading_timeout_seconds`), and
-  `response.error` has the code `backend_model_loading`.
+  long the gateway waits for a model to load (`model_loading_timeout_seconds`),
+  `response.error` has the code `backend_model_loading`, and each model of an Ollama backend in a models report
+  says where its context window comes from (`context_length_source`, see [Backends](#backends)).
 
 Both sides keep working with a peer from before a capability. The docstring of `protocol.py`
 describes each one.

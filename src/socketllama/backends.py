@@ -10,6 +10,7 @@ import logging
 import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 import httpx
 
@@ -44,6 +45,8 @@ LITELLM_CHAT_MODE = 'chat'
 # (OLLAMA_CONTEXT_LENGTH) nor the backend configuration sets one. Deliberately low: overstating
 # the window makes toptic send prompts that Ollama silently cuts from the front.
 DEFAULT_OLLAMA_CONTEXT_LENGTH = 4096
+# The details of a model whose /api/show could not be read: none
+NO_DETAILS: Mapping = MappingProxyType({})
 DISCOVERY_TIMEOUT_SECONDS = 15.0
 # A models report stays this far below the gateway's frame limit (protocol.MAX_GATEWAY_INBOUND_FRAME_BYTES)
 MODELS_REPORT_HEADROOM_BYTES = 64 * 1024
@@ -339,7 +342,9 @@ async def _discover_litellm(backend: Backend, http: httpx.AsyncClient) -> list:
 async def _discover_ollama(backend: Backend, http: httpx.AsyncClient) -> list:
     """Ollama: /v1/models lists everything pulled; /api/show tells chat models from embeddings.
 
-    The context window reported is the one requests actually get (see _ollama_context_length).
+    The context window reported is the one requests actually get, with where it comes from (see
+    _ollama_context_length). A model without details (/api/show failed) is reported all the same:
+    its window from what is known without them, and nothing about reasoning, which is unknown.
     """
     root = ollama_root(backend)
     loaded = await ollama_loaded_models(backend, http) or {}
@@ -347,19 +352,22 @@ async def _discover_ollama(backend: Backend, http: httpx.AsyncClient) -> list:
     for model in await _list_models(backend, http):
         if not backend.allows_model(model['name']):
             continue  # not shared: do not even ask for its details
+        loaded_window = loaded_context_length(loaded.get(ollama_model_reference(model['name'])))
         try:
             details = await _get_json(backend, http, root + OLLAMA_SHOW_PATH, method='POST',
                                       json={'model': model['name']})
         except (httpx.HTTPError, ValueError) as ex:
             logger.debug('Backend %s: no details for %s: %s', backend.name, printable(model['name']),
                          describe_error(ex))
+            model['context_length'], model[protocol.CONTEXT_LENGTH_SOURCE_FIELD] = _ollama_context_length(
+                backend, NO_DETAILS, loaded_window)
             models.append(model)
             continue
         capabilities = details.get('capabilities')
         if isinstance(capabilities, list) and OLLAMA_CAPABILITY_COMPLETION not in capabilities:
             continue  # embedding-only model
-        model['context_length'] = _ollama_context_length(
-            backend, details, _loaded_context_length(loaded.get(ollama_model_reference(model['name']))))
+        model['context_length'], model[protocol.CONTEXT_LENGTH_SOURCE_FIELD] = _ollama_context_length(
+            backend, details, loaded_window)
         model['supports_reasoning'] = isinstance(capabilities, list) and OLLAMA_CAPABILITY_THINKING in capabilities
         models.append(model)
     return models
@@ -395,24 +403,30 @@ def ollama_root(backend: Backend) -> str:
     return backend.base_url.removesuffix(OLLAMA_OPENAI_SUFFIX)
 
 
-def _loaded_context_length(entry):
+def loaded_context_length(entry):
     """The context window of a loaded model's /api/ps entry (an undocumented field), if it has one."""
     if entry is None or not _is_positive_int(entry.get('context_length')):
         return None
     return entry['context_length']
 
 
-def _ollama_context_length(backend: Backend, details: dict, loaded_context_length) -> int:
-    """The window requests through the OpenAI API get, which cannot set num_ctx themselves.
+def _ollama_context_length(backend: Backend, details: Mapping, loaded_context_length) -> tuple[int, str]:
+    """The window requests through the OpenAI API get, which cannot set num_ctx themselves, and its
+    source (one of protocol.CONTEXT_LENGTH_SOURCES).
 
     First match wins: the backend's configured context_length, the window of the loaded model
     (/api/ps), num_ctx of the Modelfile, Ollama's default. Never more than the architecture
-    supports (model_info.<arch>.context_length).
+    supports (model_info.<arch>.context_length); the source stays the one that named the window.
+    The default is a guess: the server's OLLAMA_CONTEXT_LENGTH, which Ollama's API does not tell,
+    may replace it, and shows only once the model is loaded.
     """
-    window = backend.context_length or loaded_context_length or _modelfile_num_ctx(details.get('parameters')) \
-        or DEFAULT_OLLAMA_CONTEXT_LENGTH
+    named = ((protocol.CONTEXT_LENGTH_SOURCE_CONFIGURED, backend.context_length),
+             (protocol.CONTEXT_LENGTH_SOURCE_LOADED, loaded_context_length),
+             (protocol.CONTEXT_LENGTH_SOURCE_MODELFILE, _modelfile_num_ctx(details.get('parameters'))))
+    source, window = next(((source, window) for source, window in named if window),
+                          (protocol.CONTEXT_LENGTH_SOURCE_DEFAULT, DEFAULT_OLLAMA_CONTEXT_LENGTH))
     architecture_maximum = _architecture_context_length(details.get('model_info'))
-    return min(window, architecture_maximum) if architecture_maximum else window
+    return (min(window, architecture_maximum) if architecture_maximum else window), source
 
 
 def _modelfile_num_ctx(parameters):

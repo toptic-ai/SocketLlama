@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "socketllama"
-version = "0.1.0"
+version = "0.1.1"
 description = "Connect your local Ollama or OpenAI-compatible models to toptic.ai through an outbound WebSocket. Use and share your local models"
 readme = "README.md"
 license = "AGPL-3.0-only"

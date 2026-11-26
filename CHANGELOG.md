@@ -3,6 +3,30 @@
 All notable changes to this project are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] - 2026-11-26
+
+### Added
+
+- Tells toptic.ai where the context window reported for each Ollama model comes from
+  (`context_length_source`: `configured`, `loaded`, `modelfile` or `default`). The `default` of
+  4096 is a guess, since the server's `OLLAMA_CONTEXT_LENGTH` is visible only once a model is
+  loaded: toptic.ai keeps the window it last saw for a loaded model while that model is out of
+  memory, instead of falling back to 4096, and still follows a `context_length` or `num_ctx`
+  that was changed or removed.
+- When a model of an Ollama backend without `context_length` comes into memory, or Ollama loads it
+  again with another window, a fresh models report follows soon (within toptic.ai's limit of one a
+  minute), not up to five minutes later, so toptic.ai learns its real window promptly. Needs a
+  toptic.ai that is told what is in memory. After lowering `OLLAMA_CONTEXT_LENGTH` (or creating a
+  model again with a smaller `num_ctx`), toptic.ai keeps planning with the window last seen loaded
+  until the model has been loaded again, usually about a minute after the next request; setting
+  `context_length` for the backend pins the window.
+
+### Fixed
+
+- An Ollama model whose details (`/api/show`) could not be read was reported without a context
+  window, also where `context_length` was configured or the model was loaded; it now gets the
+  window from those, else Ollama's default.
+
 ## [0.1.0] - 2026-11-22
 
 ### Added
@@ -26,4 +50,5 @@ All notable changes to this project are documented in this file. The format is b
 - One line per event in the terminal: the connection, the models reported, each prompt with who
   sent it and its size, and how its answer ended.
 
+[0.1.1]: https://github.com/toptic-ai/SocketLlama/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/toptic-ai/SocketLlama/releases/tag/v0.1.0

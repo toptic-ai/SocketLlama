@@ -56,6 +56,32 @@ for another kind of backend, and between the parts of an answer that has begun. 
 gateway may leave the field out, and a client that does not know it ignores it. A value that is no
 positive whole number is ignored; one above MAX_MODEL_LOADING_TIMEOUT_SECONDS counts as that.
 
+Without a capability as well, each model of an Ollama backend in a models report that has a
+"context_length" carries "context_length_source", where that window comes from (other kinds of
+backends send none; CONTEXT_LENGTH_SOURCES):
+
+    configured          The backend's context_length in config.toml.
+    loaded              The window of the model in memory, as Ollama's /api/ps lists it: what
+                        the server gives it, also where OLLAMA_CONTEXT_LENGTH set it.
+    modelfile           num_ctx of the model's Modelfile (/api/show).
+    default             None of these named one: Ollama's default num_ctx
+                        (backends.DEFAULT_OLLAMA_CONTEXT_LENGTH), a guess. The server's
+                        OLLAMA_CONTEXT_LENGTH may give requests a larger one, which Ollama's API
+                        shows only once the model is loaded. Also when /api/show could not be read
+                        and nothing else named one.
+
+The window is never more than the model's architecture supports; the source stays the one that
+named it (a capped default is still "default"). What the gateway makes of it: while a model is not
+in memory and reported with "default", it keeps the window last reported for it as "loaded", the
+server's own setting; a report with any other source replaces that window (a configured or
+Modelfile window that is gone was removed by the owner, so the default counts again then). So
+that it learns a loaded window soon, the client sends a fresh models report when /api/ps lists a
+window for a model of an Ollama backend without a configured context_length that the last report
+did not carry for it as loaded: the model came into memory, or was loaded again with another
+window (seen by the models.memory checks, so only with that capability; see models_memory),
+within the gateway's limit of one report per MODELS_REPORT_RESEND_SECONDS (client). A gateway
+that does not know the field ignores it.
+
 The other way round, this client lists what it can take in auth ("capabilities"), and the gateway
 uses one only when it is listed. A gateway that does not know the list ignores it.
 
@@ -97,6 +123,15 @@ PROGRESS_STAGE_MODEL_NOT_IN_MEMORY = 'model_not_in_memory'
 
 # Field of a backend in a models report; only ever sent as false (see models.unchecked)
 BACKEND_CHECKED_FIELD = 'checked'
+# Field of a model of an Ollama backend in a models report: where its context_length comes from, one of these
+# (see the module docstring)
+CONTEXT_LENGTH_SOURCE_FIELD = 'context_length_source'
+CONTEXT_LENGTH_SOURCE_CONFIGURED = 'configured'
+CONTEXT_LENGTH_SOURCE_LOADED = 'loaded'
+CONTEXT_LENGTH_SOURCE_MODELFILE = 'modelfile'
+CONTEXT_LENGTH_SOURCE_DEFAULT = 'default'
+CONTEXT_LENGTH_SOURCES = (CONTEXT_LENGTH_SOURCE_CONFIGURED, CONTEXT_LENGTH_SOURCE_LOADED,
+                          CONTEXT_LENGTH_SOURCE_MODELFILE, CONTEXT_LENGTH_SOURCE_DEFAULT)
 
 # gateway -> client
 FRAME_AUTH_REQUIRED = 'auth_required'

@@ -350,7 +350,7 @@ class TunnelClient:
         self._model_memory().gateway_waits_for_loading(model_loading_timeout)
         memory_report = ModelsMemoryReport(self._config.backends, self._http, lambda frame: self._send(socket, frame),
                                            self._clock, sent_at=self._memory_report_sent_at,
-                                           shown=self._memory_shown) \
+                                           shown=self._memory_shown, report_outdated=self._report_requested.set) \
             if protocol.CAPABILITY_MODELS_MEMORY in capabilities else None
         self._memory_report = memory_report
         relay = Relay(self._config, self._http, lambda frame: self._send(socket, frame), nonce,
